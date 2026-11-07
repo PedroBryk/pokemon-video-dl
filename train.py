@@ -1,9 +1,12 @@
 """
-Passo 2 - Treino com Transfer Learning (MobileNetV2).
+Passo 2 - Treino com Transfer Learning (MobileNetV2) + FINE-TUNING.
 Uso: python train.py
-A base (MobileNetV2, pre-treinada na ImageNet) fica congelada e so a
+
+FASE 1: a base (MobileNetV2, pre-treinada na ImageNet) fica congelada e so a
 "cabeca" nova aprende, igual a atividade anterior.
-A diferenca: a validacao e separada POR VIDEO.
+FASE 2 (MELHORIA 3): descongela as ultimas camadas da base e continua o treino
+com uma taxa de aprendizado bem menor (fine-tuning).
+A validacao e separada POR VIDEO nas duas fases.
 """
 import os
 import json
@@ -21,11 +24,17 @@ BATCH = 16
 EPOCHS = 8
 VAL_FRACTION = 0.2  # fracao de VIDEOS (nao de fotos) para validacao
 SEED = 42
+# --- MELHORIA 3 (fine-tuning): parametros da segunda fase ---
+EPOCHS_FT = 8       # maximo de epocas da fase 2
+N_DESCONGELAR = 30  # quantas camadas finais da MobileNetV2 voltam a treinar
+LR_FT = 1e-5        # taxa de aprendizado bem menor que a da fase 1 (1e-3)
 random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
 class_names = sorted(d for d in os.listdir(DATA_DIR)
                      if os.path.isdir(os.path.join(DATA_DIR, d)))
 print("Classes:", class_names)
+with open("class_names.json", "w") as f:
+    json.dump(class_names, f)
 
 # ---- Split POR VIDEO ------------------------------------------------------
 # Frames do mesmo video sao quase iguais. Se um video tiver frames no treino e
@@ -94,45 +103,78 @@ x = tf.keras.layers.Dropout(0.3)(x)
 outputs = tf.keras.layers.Dense(len(class_names), activation="softmax")(x)
 model = tf.keras.Model(inputs, outputs)
 
+
+def avaliar(titulo):
+    """Imprime a loss, a matriz de confusao e a precisao/recall na validacao.
+    Chamada apos cada fase para podermos comparar antes e depois."""
+    val_loss, val_acc = model.evaluate(val_ds, verbose=0)
+    y_true = np.array(val_y)
+    y_pred = np.argmax(model.predict(val_ds, verbose=0), axis=1)
+    k = len(class_names)
+    cm = np.zeros((k, k), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[t, p] += 1
+    print(f"\n===== {titulo} =====")
+    print("Matriz de confusao (linhas = real, colunas = previsto):")
+    print(" " * 11 + " ".join(f"{c[:8]:>8}" for c in class_names))
+    for i, c in enumerate(class_names):
+        print(f"{c[:10]:>10} " + " ".join(f"{v:>8}" for v in cm[i]))
+    print("\nClasse        precisao   recall")
+    for i, c in enumerate(class_names):
+        prec = cm[i, i] / max(cm[:, i].sum(), 1)
+        rec = cm[i, i] / max(cm[i, :].sum(), 1)
+        print(f"{c[:12]:<12} {prec:>9.2%} {rec:>8.2%}")
+    print(f"\nAcuracia de validacao: {val_acc:.2%} | loss de validacao: {val_loss:.4f}")
+
+
+# ==== FASE 1: treina so a cabeca (base congelada) ============================
+print("\n##### FASE 1: treino da cabeca (base congelada) #####")
 parar = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3,
                                          restore_best_weights=True)
 model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
               loss="sparse_categorical_crossentropy", metrics=["accuracy"])
 model.summary()
 
-hist = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=[parar])
-model.save("modelo.keras")
-with open("class_names.json", "w") as f:
-    json.dump(class_names, f)
+hist1 = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=[parar])
+model.save("modelo_base.keras")  # guarda a versao da fase 1 para comparar depois
+avaliar("FASE 1 - base congelada")
 
-# ---- Curvas de treino vs validacao ---------------------------------------
+# ==== FASE 2 (MELHORIA 3): FINE-TUNING ======================================
+# Descongela so as ultimas N_DESCONGELAR camadas da MobileNetV2 e continua o
+# treino com taxa de aprendizado bem menor. A cabeca ja foi treinada na fase 1;
+# se a base fosse descongelada com a cabeca aleatoria, os gradientes grandes
+# destruiriam os filtros pre-treinados.
+print(f"\n##### FASE 2: fine-tuning das ultimas {N_DESCONGELAR} camadas (lr={LR_FT}) #####")
+base.trainable = True
+for layer in base.layers[:-N_DESCONGELAR]:
+    layer.trainable = False
+
+# OBRIGATORIO recompilar depois de mudar o que e treinavel
+model.compile(optimizer=tf.keras.optimizers.Adam(LR_FT),
+              loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+n_treinaveis = int(sum(np.prod(w.shape) for w in model.trainable_weights))
+print(f"Parametros treinaveis na fase 2: {n_treinaveis:,}")
+
+parar_ft = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=3,
+                                            restore_best_weights=True)
+n1 = len(hist1.history["loss"])  # epocas realmente executadas na fase 1
+hist2 = model.fit(train_ds, validation_data=val_ds,
+                  epochs=n1 + EPOCHS_FT, initial_epoch=n1, callbacks=[parar_ft])
+
+model.save("modelo.keras")  # modelo final (o detectar.py usa este arquivo)
+
+# ---- Curvas de treino vs validacao (fase 1 + fase 2) ----------------------
+# MELHORIA 3: o grafico junta os dois historicos e marca onde comeca o fine-tuning.
 plt.figure(figsize=(10, 4))
 for i, (m, t) in enumerate([("accuracy", "Acuracia"), ("loss", "Loss")]):
     plt.subplot(1, 2, i + 1)
-    plt.plot(hist.history[m], label="treino")
-    plt.plot(hist.history["val_" + m], label="validacao")
+    plt.plot(hist1.history[m] + hist2.history[m], label="treino")
+    plt.plot(hist1.history["val_" + m] + hist2.history["val_" + m], label="validacao")
+    plt.axvline(n1 - 0.5, color="red", linestyle="--", label="inicio do fine-tuning")
     plt.title(t); plt.xlabel("epoca"); plt.legend()
 plt.tight_layout(); plt.savefig("curvas.png")
 
-# ---- Matriz de confusao + precisao/recall por classe ----------------------
-y_true = np.array(val_y)
-y_pred = np.argmax(model.predict(val_ds, verbose=0), axis=1)
-k = len(class_names)
-cm = np.zeros((k, k), dtype=int)
-for t, p in zip(y_true, y_pred):
-    cm[t, p] += 1
-
-print("\nMatriz de confusao (linhas = real, colunas = previsto):")
-print(" " * 11 + " ".join(f"{c[:8]:>8}" for c in class_names))
-for i, c in enumerate(class_names):
-    print(f"{c[:10]:>10} " + " ".join(f"{v:>8}" for v in cm[i]))
-
-print("\nClasse        precisao   recall")
-for i, c in enumerate(class_names):
-    prec = cm[i, i] / max(cm[:, i].sum(), 1)
-    rec = cm[i, i] / max(cm[i, :].sum(), 1)
-    print(f"{c[:12]:<12} {prec:>9.2%} {rec:>8.2%}")
-print(f"\nAcuracia de validacao: {np.trace(cm) / cm.sum():.2%}")
+avaliar("FASE 2 - apos fine-tuning (modelo final)")
 
 # ---- PDF do dataset (entrega obrigatoria) ---------------------------------
 from PIL import Image, ImageDraw, ImageFont
@@ -181,4 +223,5 @@ def gerar_pdf_dataset(data_dir="data", saida="dataset_imagens.pdf", cols=10,
 
 
 gerar_pdf_dataset(DATA_DIR)
-print("\nPronto! Modelo salvo em modelo.keras. Agora rode: python detectar.py meu_video.mp4")
+print("\nPronto! Modelo final em modelo.keras (versao da fase 1 em modelo_base.keras).")
+print("Agora rode: python detectar.py meu_video.mp4")
