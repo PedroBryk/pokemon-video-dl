@@ -1,0 +1,7 @@
+videos/
+data/
+teste/
+__pycache__/
+*.pyc
+venv/
+.venv/
